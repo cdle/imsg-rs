@@ -1,17 +1,23 @@
 # imsg-rs
 
-本机 iMessage 的轻量 HTTP 和 WebSocket bridge。服务只读 `chat.db`，通过 macOS 文件事件及时扫描新记录，并每 5 秒兜底扫描。文件事件通常会很快触发，但操作系统、磁盘和数据库事务都可能引入延迟，因此不承诺严格实时。
+本机 iMessage 的轻量 HTTP 和 WebSocket bridge。服务只读 `chat.db`，在常驻只读 SQLite 连接上每 25 毫秒检查 `PRAGMA data_version`；检测到外部提交后增量扫描，并每 5 秒校准一次游标。实际推送延迟取决于系统调度和数据库可读性，不提供硬实时保证。
 
 ## 运行
 
 需要 Rust 工具链和当前登录用户可读取的 `~/Library/Messages/chat.db`。构建并安装用户级 LaunchAgent：
 
 ```sh
-cargo build --release
-mkdir -p ~/Library/LaunchAgents
-cp com.muse.imsg-rs.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.muse.imsg-rs.plist
+cargo build --release --target-dir /private/tmp/imsg-rs-build
+mkdir -p "$HOME/.local/bin" "$HOME/Library/LaunchAgents"
+launchctl bootout gui/$(id -u)/com.muse.imsg-rs 2>/dev/null || true
+install -m 755 /private/tmp/imsg-rs-build/release/imsg-rs "$HOME/.local/bin/imsg-rs"
+cp com.muse.imsg-rs.plist "$HOME/Library/LaunchAgents/"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 $HOME/.local/bin/imsg-rs" \
+  "$HOME/Library/LaunchAgents/com.muse.imsg-rs.plist"
+launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.muse.imsg-rs.plist"
 ```
+
+构建产物和安装程序放在本机磁盘，源码可以放在 NAS。plist 模板中的路径占位符由上面的 `PlistBuddy` 命令替换；launchd 本身不会展开环境变量。
 
 服务默认监听 `127.0.0.1:8420`（HTTP）和 `127.0.0.1:8421`（WebSocket）。游标和日志默认存放在 `~/Library/Application Support/imsg-rs/`。可通过 `IMSG_DB_PATH`、`IMSG_CURSOR_PATH`、`IMSG_LOG_PATH`、`IMSG_HTTP_ADDR` 和 `IMSG_WS_ADDR` 覆盖默认值。
 
@@ -36,7 +42,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.muse.imsg-rs.plist
 
 ## 边界
 
-- 接收由 FSEvents 触发扫描，并有 5 秒兜底；不是严格实时保证。
+- 接收每 25 毫秒检查 SQLite 提交版本，并每 5 秒校准；不是硬实时保证。
 - API 默认仅监听本机回环地址，不提供身份认证。不要把监听地址改为局域网或公网地址。
 - 浏览器来源只接受 localhost；非浏览器 AI 客户端通常不会发送 `Origin`。
 - `chat.db` 以只读方式打开。空文本和无法解码为文本的系统记录不会作为消息推送，但扫描游标仍会越过这些记录。

@@ -17,7 +17,10 @@ use tungstenite::{Error as WsError, Message, WebSocket};
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8420";
 const DEFAULT_WS_ADDR: &str = "127.0.0.1:8421";
-const FALLBACK_INTERVAL: Duration = Duration::from_secs(5);
+const DATABASE_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const DATABASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const FALLBACK_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+const DATABASE_IDENTITY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HTTP_BODY: usize = 64 * 1024;
 const MAX_SEND_TEXT: usize = 32 * 1024;
@@ -63,7 +66,7 @@ struct App {
     cursor: AtomicI64,
     next_subscriber: AtomicU64,
     subscribers: Mutex<HashMap<u64, mpsc::SyncSender<String>>>,
-    watcher_active: AtomicUsize,
+    receiver_active: AtomicUsize,
     http_connections: Arc<AtomicUsize>,
     ws_connections: Arc<AtomicUsize>,
 }
@@ -81,7 +84,7 @@ impl App {
             cursor: AtomicI64::new(cursor),
             next_subscriber: AtomicU64::new(1),
             subscribers: Mutex::new(HashMap::new()),
-            watcher_active: AtomicUsize::new(0),
+            receiver_active: AtomicUsize::new(0),
             http_connections: Arc::new(AtomicUsize::new(0)),
             ws_connections: Arc::new(AtomicUsize::new(0)),
         }
@@ -312,115 +315,154 @@ fn broadcast(app: &App, message: &Msg) {
     });
 }
 
-fn process_new_messages(app: &App, cursor: &mut i64) -> bool {
-    match query_rows(&app.db_path, *cursor, MAX_BATCH_ROWS) {
-        Ok(rows) => {
-            let more_pending = rows.len() == MAX_BATCH_ROWS as usize;
-            if let Some(last) = rows.last() {
-                let next_cursor = last.rowid;
-                let mut delivered = 0usize;
-                for row in rows {
-                    if let Some(message) = decode_row(row) {
-                        broadcast(app, &message);
-                        delivered += 1;
-                    }
-                }
-                if next_cursor > *cursor {
-                    if let Err(error) = write_cursor(&app.cursor_path, next_cursor) {
-                        app.log(&format!("could not persist message cursor: {error}"));
-                    }
-                    *cursor = next_cursor;
-                    app.cursor.store(next_cursor, Ordering::Release);
-                }
-                app.log(&format!(
-                    "scanned through rowid={next_cursor}, delivered={delivered}"
-                ));
+fn process_new_messages(app: &App, cursor: &mut i64) -> Result<bool, String> {
+    let rows = query_rows(&app.db_path, *cursor, MAX_BATCH_ROWS)?;
+    let more_pending = rows.len() == MAX_BATCH_ROWS as usize;
+    if let Some(last) = rows.last() {
+        let next_cursor = last.rowid;
+        let mut delivered = 0usize;
+        for row in rows {
+            if let Some(message) = decode_row(row) {
+                broadcast(app, &message);
+                delivered += 1;
             }
-            more_pending
         }
-        Err(error) => {
-            app.log(&format!("message scan failed: {error}"));
-            false
+        if next_cursor > *cursor {
+            if let Err(error) = write_cursor(&app.cursor_path, next_cursor) {
+                app.log(&format!("could not persist message cursor: {error}"));
+            }
+            *cursor = next_cursor;
+            app.cursor.store(next_cursor, Ordering::Release);
         }
+        app.log(&format!(
+            "scanned through rowid={next_cursor}, delivered={delivered}"
+        ));
     }
+    Ok(more_pending)
 }
 
-fn is_chat_database_event(event: &notify::Event) -> bool {
-    event.paths.iter().any(|path| {
-        matches!(
-            path.file_name().and_then(|name| name.to_str()),
-            Some("chat.db" | "chat.db-wal" | "chat.db-shm")
-        )
-    })
+fn drain_new_messages(app: &App, cursor: &mut i64) -> Result<(), String> {
+    while process_new_messages(app, cursor)? {}
+    Ok(())
+}
+
+fn database_version(connection: &Connection) -> Result<i64, String> {
+    connection
+        .query_row("PRAGMA data_version", [], |row| row.get(0))
+        .map_err(|error| format!("read chat database version: {error}"))
+}
+
+fn database_identity(path: &Path) -> Result<(u64, u64), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).map_err(|error| format!("stat chat database: {error}"))?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 fn receive_loop(app: Arc<App>) {
-    use notify::{RecursiveMode, Watcher};
-
-    let (event_tx, event_rx) = mpsc::channel();
-    let mut watcher = match notify::recommended_watcher(event_tx) {
-        Ok(watcher) => Some(watcher),
-        Err(error) => {
-            app.log(&format!(
-                "file watcher unavailable; using fallback scan: {error}"
-            ));
-            None
-        }
-    };
-    if let Some(active_watcher) = watcher.as_mut() {
-        let parent = app.db_path.parent().unwrap_or_else(|| Path::new("/"));
-        match active_watcher.watch(parent, RecursiveMode::NonRecursive) {
-            Ok(()) => {
-                app.watcher_active.store(1, Ordering::Release);
-                app.log("watching the Messages database directory");
-            }
-            Err(error) => {
-                app.log(&format!("file watch failed; using fallback scan: {error}"));
-                watcher = None;
-            }
-        }
-    }
-
     let mut cursor = app.cursor.load(Ordering::Acquire);
+    let mut monitor: Option<Connection> = None;
+    let mut monitor_identity = None;
+    let mut last_version = None;
+    let mut next_scan_retry = Instant::now();
+    let mut next_fallback_scan = Instant::now();
+    let mut next_identity_check = Instant::now();
+
     loop {
-        if process_new_messages(&app, &mut cursor) {
-            continue;
-        }
-        if watcher.is_none() {
-            std::thread::sleep(FALLBACK_INTERVAL);
-            continue;
-        }
-        match event_rx.recv_timeout(FALLBACK_INTERVAL) {
-            Ok(Ok(event)) if is_chat_database_event(&event) => {
-                let mut watcher_error = None;
-                loop {
-                    match event_rx.try_recv() {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(error)) => {
-                            watcher_error = Some(error);
-                            break;
+        if monitor.is_none() {
+            let opened = database_identity(&app.db_path).and_then(|identity_before| {
+                let connection = open_database(&app.db_path)?;
+                let version = database_version(&connection)?;
+                let identity_after = database_identity(&app.db_path)?;
+                if identity_before != identity_after {
+                    return Err("Messages database changed while opening monitor".to_string());
+                }
+                Ok((connection, identity_after, version))
+            });
+            match opened {
+                Ok((connection, identity_after, version)) => {
+                    monitor = Some(connection);
+                    monitor_identity = Some(identity_after);
+                    last_version = Some(version);
+                    app.receiver_active.store(1, Ordering::Release);
+                    app.log("monitoring SQLite data_version every 25 ms");
+                    match drain_new_messages(&app, &mut cursor) {
+                        Ok(()) => {
+                            let now = Instant::now();
+                            next_scan_retry = now;
+                            next_fallback_scan = now + FALLBACK_SCAN_INTERVAL;
                         }
-                        Err(_) => break,
+                        Err(error) => {
+                            app.log(&format!("message scan failed: {error}"));
+                            let retry_at = Instant::now() + DATABASE_RETRY_INTERVAL;
+                            next_scan_retry = retry_at;
+                            next_fallback_scan = retry_at;
+                        }
                     }
+                    next_identity_check = Instant::now() + DATABASE_IDENTITY_CHECK_INTERVAL;
+                    continue;
                 }
-                if let Some(error) = watcher_error {
-                    app.log(&format!("file watcher reported an error: {error}"));
-                    app.watcher_active.store(0, Ordering::Release);
-                    watcher = None;
+                Err(error) => app.log(&format!("message monitor unavailable: {error}")),
+            }
+            app.receiver_active.store(0, Ordering::Release);
+            std::thread::sleep(DATABASE_RETRY_INTERVAL);
+            continue;
+        }
+
+        std::thread::sleep(DATABASE_POLL_INTERVAL);
+        let version = match database_version(monitor.as_ref().expect("monitor connection")) {
+            Ok(version) => version,
+            Err(error) => {
+                app.log(&error);
+                monitor = None;
+                monitor_identity = None;
+                last_version = None;
+                app.receiver_active.store(0, Ordering::Release);
+                std::thread::sleep(DATABASE_RETRY_INTERVAL);
+                continue;
+            }
+        };
+
+        let now = Instant::now();
+        let changed = last_version != Some(version);
+        if (changed && now >= next_scan_retry) || now >= next_fallback_scan {
+            match drain_new_messages(&app, &mut cursor) {
+                Ok(()) => {
+                    last_version = Some(version);
+                    let scanned_at = Instant::now();
+                    next_scan_retry = scanned_at;
+                    next_fallback_scan = scanned_at + FALLBACK_SCAN_INTERVAL;
+                }
+                Err(error) => {
+                    app.log(&format!("message scan failed: {error}"));
+                    let retry_at = Instant::now() + DATABASE_RETRY_INTERVAL;
+                    next_scan_retry = retry_at;
+                    next_fallback_scan = retry_at;
                 }
             }
-            Ok(Ok(_)) => continue,
-            Ok(Err(error)) => {
-                app.log(&format!("file watcher reported an error: {error}"));
-                app.watcher_active.store(0, Ordering::Release);
-                watcher = None;
+        }
+
+        if now >= next_identity_check {
+            match database_identity(&app.db_path) {
+                Ok(identity) if Some(identity) == monitor_identity => {}
+                Ok(_) => {
+                    app.log("Messages database file was replaced; reopening monitor");
+                    monitor = None;
+                    monitor_identity = None;
+                    last_version = None;
+                    app.receiver_active.store(0, Ordering::Release);
+                    continue;
+                }
+                Err(error) => {
+                    app.log(&error);
+                    monitor = None;
+                    monitor_identity = None;
+                    last_version = None;
+                    app.receiver_active.store(0, Ordering::Release);
+                    continue;
+                }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                app.log("file watcher stopped; using fallback scan");
-                app.watcher_active.store(0, Ordering::Release);
-                watcher = None;
-            }
+            next_identity_check = Instant::now() + DATABASE_IDENTITY_CHECK_INTERVAL;
         }
     }
 }
@@ -518,16 +560,20 @@ fn serve_http(mut request: Request, app: Arc<App>) {
     let method = request.method().as_str();
     let (status, payload) = match (method, path) {
         ("GET", "/health") => match latest_rowid(&app.db_path) {
-            Ok(latest) => (
-                200,
-                serde_json::json!({
-                    "ok": true,
-                    "watcher": app.watcher_active.load(Ordering::Acquire) == 1,
-                    "cursor": app.cursor.load(Ordering::Acquire),
-                    "latest_rowid": latest
-                })
-                .to_string(),
-            ),
+            Ok(latest) => {
+                let receiver_active = app.receiver_active.load(Ordering::Acquire) == 1;
+                (
+                    200,
+                    serde_json::json!({
+                        "ok": true,
+                        "watcher": receiver_active,
+                        "receiver_active": receiver_active,
+                        "cursor": app.cursor.load(Ordering::Acquire),
+                        "latest_rowid": latest
+                    })
+                    .to_string(),
+                )
+            }
             Err(error) => (503, error_json(&error)),
         },
         ("GET", "/messages") => match parse_since(query) {
@@ -1003,7 +1049,7 @@ mod tests {
             cursor: AtomicI64::new(0),
             next_subscriber: AtomicU64::new(1),
             subscribers: Mutex::new(HashMap::new()),
-            watcher_active: AtomicUsize::new(0),
+            receiver_active: AtomicUsize::new(0),
             http_connections: Arc::new(AtomicUsize::new(0)),
             ws_connections: Arc::new(AtomicUsize::new(0)),
         };
@@ -1032,6 +1078,63 @@ mod tests {
             serde_json::to_string(&message).unwrap()
         );
         assert_eq!(lock(&app.subscribers).len(), 1);
+    }
+
+    #[test]
+    fn database_version_tracks_external_wal_commits() {
+        static NEXT_DB: AtomicUsize = AtomicUsize::new(0);
+        let path = Path::new("/private/tmp").join(format!(
+            "imsg-rs-wal-test-{}-{}.sqlite",
+            std::process::id(),
+            NEXT_DB.fetch_add(1, Ordering::Relaxed)
+        ));
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE message (
+                    ROWID INTEGER PRIMARY KEY,
+                    date INTEGER NOT NULL,
+                    is_from_me INTEGER NOT NULL,
+                    text TEXT,
+                    attributedBody BLOB,
+                    handle_id INTEGER,
+                    cache_has_attachments INTEGER
+                );
+                CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, guid TEXT, chat_identifier TEXT);
+                CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+                CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+                INSERT INTO chat VALUES (1, 'iMessage;-;chat-1', 'contact@example.com');
+                INSERT INTO handle VALUES (1, 'contact@example.com');",
+            )
+            .unwrap();
+        let journal_mode: String = writer
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+
+        let monitor = open_database(&path).unwrap();
+        let initial_version = database_version(&monitor).unwrap();
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 INSERT INTO message VALUES (4, 700000000000000003, 0, 'wal commit', NULL, 1, 0);
+                 INSERT INTO chat_message_join VALUES (1, 4);
+                 COMMIT;",
+            )
+            .unwrap();
+        let committed_version = database_version(&monitor).unwrap();
+
+        assert_ne!(initial_version, committed_version);
+        assert_eq!(database_version(&monitor).unwrap(), committed_version);
+        let rows = query_rows(&path, 3, MAX_BATCH_ROWS).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text.as_deref(), Some("wal commit"));
+
+        drop(monitor);
+        drop(writer);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("sqlite-wal"));
+        let _ = fs::remove_file(path.with_extension("sqlite-shm"));
     }
 
     #[test]
