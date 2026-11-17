@@ -195,8 +195,17 @@ fn main() {
         let (status, payload) = match (method.as_str(), url.split('?').next().unwrap_or("")) {
             ("GET", "/health") => (200, r#"{"ok":true}"#.to_string()),
             ("GET", "/messages") => {
-                let cur = read_cursor();
-                match poll_once(cur.saturating_sub(20).max(0)) {
+                // Optional ?since=<rowid> for incremental fetch. Default is the
+                // last 20 rows before the cursor. The caller tracks the highest
+                // rowid it has seen and passes it back as `since`.
+                let since = url.split_once('?').and_then(|(_, q)| {
+                    q.split('&').find_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        (k == "since").then_some(v).and_then(|v| v.parse::<i64>().ok())
+                    })
+                });
+                let start = since.unwrap_or_else(|| read_cursor().saturating_sub(20).max(0));
+                match poll_once(start) {
                     Ok(v) => (200, serde_json::to_string(&v).unwrap_or_default()),
                     Err(e) => (500, format!("{{\"error\":\"{}\"}}", e.replace('"', "'"))),
                 }
