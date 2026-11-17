@@ -11,7 +11,14 @@ const DB_PATH: &str = "$HOME/Library/Messages/chat.db";
 const CURSOR_PATH: &str = "$PROJECT_ROOT/cursor.txt";
 const ACCOUNT_ID: &str = "ACCOUNT_ID";
 const FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const WS_PORT: u16 = 8421;
 const SEND_TIMEOUT_SECS: u64 = 15;
+
+lazy_static::lazy_static! {
+    static ref WS_BROADCAST: (crossbeam_channel::Sender<String>, crossbeam_channel::Receiver<String>) = {
+        crossbeam_channel::bounded::<String>(1024)
+    };
+}
 
 #[derive(Deserialize)]
 struct SendBody {
@@ -143,6 +150,9 @@ fn process_new_messages() {
                         "recv rowid={} from_me={} text={:?}",
                         m.rowid, m.from_me, m.text
                     ));
+                    if let Ok(json) = serde_json::to_string(m) {
+                        let _ = WS_BROADCAST.0.send(json);
+                    }
                 }
                 write_cursor(msgs.last().unwrap().rowid);
             }
@@ -154,6 +164,52 @@ fn process_new_messages() {
 fn main() {
     let server = Server::http("127.0.0.1:8420").expect("bind 127.0.0.1:8420");
     append_log("imsg-rs started on 127.0.0.1:8420");
+    // WebSocket server on a separate port. Each accepted connection gets a
+    // tungstenite WebSocket over the raw TcpStream, then subscribes to the
+    // broadcast channel for new messages.
+    std::thread::spawn(move || {
+        use std::net::TcpListener;
+        use tungstenite::{accept as ws_accept, Message};
+        let listener = match TcpListener::bind(("127.0.0.1", WS_PORT)) {
+            Ok(l) => l,
+            Err(e) => {
+                append_log(&format!("ws bind failed: {e}"));
+                return;
+            }
+        };
+        append_log(&format!("ws listening on 127.0.0.1:{WS_PORT}"));
+        for stream in listener.incoming() {
+            let stream = match stream {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let _ = stream.set_nodelay(true);
+            let mut ws = match ws_accept(stream) {
+                Ok(ws) => ws,
+                Err(e) => {
+                    append_log(&format!("ws handshake failed: {e}"));
+                    continue;
+                }
+            };
+            let rx = WS_BROADCAST.1.clone();
+            std::thread::spawn(move || loop {
+                // Read any incoming control frames (close/ping) non-blockingly.
+                match rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(json) => {
+                        if ws.send(Message::Text(json)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+                match ws.read() {
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            });
+        }
+    });
     // Fallback polling loop; primary path is the FSEvents watcher below.
     std::thread::spawn(move || loop {
         process_new_messages();
