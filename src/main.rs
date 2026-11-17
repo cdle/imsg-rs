@@ -10,7 +10,7 @@ use tiny_http::{Header, Response, Server};
 const DB_PATH: &str = "$HOME/Library/Messages/chat.db";
 const CURSOR_PATH: &str = "$PROJECT_ROOT/cursor.txt";
 const ACCOUNT_ID: &str = "ACCOUNT_ID";
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
+const FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const SEND_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Deserialize)]
@@ -133,26 +133,58 @@ fn append_log(line: &str) {
     }
 }
 
+fn process_new_messages() {
+    let cur = read_cursor();
+    match poll_once(cur) {
+        Ok(msgs) => {
+            if !msgs.is_empty() {
+                for m in &msgs {
+                    append_log(&format!(
+                        "recv rowid={} from_me={} text={:?}",
+                        m.rowid, m.from_me, m.text
+                    ));
+                }
+                write_cursor(msgs.last().unwrap().rowid);
+            }
+        }
+        Err(e) => append_log(&format!("poll error: {e}")),
+    }
+}
+
 fn main() {
     let server = Server::http("127.0.0.1:8420").expect("bind 127.0.0.1:8420");
     append_log("imsg-rs started on 127.0.0.1:8420");
+    // Fallback polling loop; primary path is the FSEvents watcher below.
     std::thread::spawn(move || loop {
-        let cur = read_cursor();
-        match poll_once(cur) {
-            Ok(msgs) => {
-                if !msgs.is_empty() {
-                    for m in &msgs {
-                        append_log(&format!(
-                            "recv rowid={} from_me={} text={:?}",
-                            m.rowid, m.from_me, m.text
-                        ));
-                    }
-                    write_cursor(msgs.last().unwrap().rowid);
-                }
+        process_new_messages();
+        std::thread::sleep(FALLBACK_POLL_INTERVAL);
+    });
+
+    // Event-driven receive: FSEvents fires on writes under ~/Library/Messages,
+    // so new rows are picked up within milliseconds of the DB write.
+    std::thread::spawn(move || {
+        use notify::{RecursiveMode, Watcher};
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(tx) {
+            Ok(w) => w,
+            Err(e) => {
+                append_log(&format!("watcher init failed, fallback polling only: {e}"));
+                return;
             }
-            Err(e) => append_log(&format!("poll error: {e}")),
+        };
+        if let Err(e) = watcher.watch(
+            std::path::Path::new("$HOME/Library/Messages"),
+            RecursiveMode::Recursive,
+        ) {
+            append_log(&format!("watcher watch failed, fallback polling only: {e}"));
+            return;
         }
-        std::thread::sleep(POLL_INTERVAL);
+        append_log("fs watcher active");
+        for ev in rx {
+            if ev.is_ok() {
+                process_new_messages();
+            }
+        }
     });
 
     for mut req in server.incoming_requests() {

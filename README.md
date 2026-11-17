@@ -28,12 +28,12 @@ launchd 会常驻并自动重启。
 
 ## 数据
 
-- 收：每秒轮询 `~/Library/Messages/chat.db`（只读），游标存 `cursor.txt`，空文本（已读回执等）已过滤。
+- 收：FSEvents 监听 `~/Library/Messages`，写入后毫秒级读 `chat.db`（只读，实测事件触发 <30ms），另有 5 秒兜底轮询；游标存 `cursor.txt`，空文本（已读回执等）已过滤。
 - 发：写 `/tmp/imsg-rs-send.scpt` 后经 `ssh localhost` 执行，超时 15s。
 - 日志：`imsg-rs.log`（收到的消息与错误）。
 
 ## 已知边界
 
-- 收是 1 秒轮询，不是 AppleScript 事件推送；家用足够，但要严格实时就需事件钩子。
+- 收依赖 FSEvents；极端情况下事件丢失会由 5 秒兜底轮询补上。
 - 发送用的是固定 iMessage 账户 `ACCOUNT_ID`（本机当前唯一 iMessage 账户），如果账户变了需要改 `ACCOUNT_ID`。
 - 所有流量都在 127.0.0.1:8420，没有鉴权；只在本机用。
