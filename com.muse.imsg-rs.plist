@@ -16,10 +16,5 @@
     <string>/tmp/imsg-rs-launchd.out</string>
     <key>StandardErrorPath</key>
     <string>/tmp/imsg-rs-launchd.err</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>$HOME</string>
-    </dict>
 </dict>
 </plist>

@@ -1,39 +1,42 @@
 # imsg-rs
 
-轻量的本机 iMessage ↔ HTTP 服务。轮询 `chat.db` 收消息，通过 `ssh localhost` + osascript 发消息，让 AI 或其他程序用一个 HTTP 接口接入 iMessage。
-
-## 为什么这么写
-
-- 直接跑 osascript 时，TCC 会把自动化请求归因到 ChatGPT/codex 宿主链（magpie），而 magpie 没有合适的 entitlement，导致一直 -1712 超时。
-- 通过 `ssh localhost` 起 osascript，自动化请求的"责任进程"变成 sshd，不受那层嵌套 GUI 链影响，发送实测可用。
-- 不依赖 Matrix、不依赖 macOS 14+，纯本机轮询。
+本机 iMessage 的轻量 HTTP 和 WebSocket bridge。服务只读 `chat.db`，通过 macOS 文件事件及时扫描新记录，并每 5 秒兜底扫描。文件事件通常会很快触发，但操作系统、磁盘和数据库事务都可能引入延迟，因此不承诺严格实时。
 
 ## 运行
 
+需要 Rust 工具链和当前登录用户可读取的 `~/Library/Messages/chat.db`。构建并安装用户级 LaunchAgent：
+
 ```sh
 cargo build --release
+mkdir -p ~/Library/LaunchAgents
 cp com.muse.imsg-rs.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/501 ~/Library/LaunchAgents/com.muse.imsg-rs.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.muse.imsg-rs.plist
 ```
 
-launchd 会常驻并自动重启。
+服务默认监听 `127.0.0.1:8420`（HTTP）和 `127.0.0.1:8421`（WebSocket）。游标和日志默认存放在 `~/Library/Application Support/imsg-rs/`。可通过 `IMSG_DB_PATH`、`IMSG_CURSOR_PATH`、`IMSG_LOG_PATH`、`IMSG_HTTP_ADDR` 和 `IMSG_WS_ADDR` 覆盖默认值。
 
-## API
+如果服务日志显示无法打开 `chat.db`，需要在 macOS 隐私设置中允许运行该服务的程序读取信息；LaunchAgent 以当前登录用户身份运行。
+
+## HTTP
 
 | 方法 | 路径 | 说明 |
-|---|---|---|
-| GET  | `/health`   | 存活检查 |
-| GET  | `/messages` | 最近 20 条（含游标前后的收发记录） |
-| POST | `/send`     | `{"to":"...","text":"..."}`，to 是 iMessage 账号（邮箱或手机号） |
+| --- | --- | --- |
+| `GET` | `/health` | 服务状态、扫描游标和数据库最新 rowid |
+| `GET` | `/messages` | 最近 20 条可解码的消息 |
+| `GET` | `/messages?since=<rowid>` | 获取 rowid 大于游标的消息，单次最多 1000 条 |
+| `POST` | `/send` | 发送消息，JSON body 为 `{"to":"账号或手机号","text":"内容"}` |
 
-## 数据
+消息对象包含 `rowid`、`date`、`from_me`、`chat_id`、`sender`、`has_attachments` 和 `text`。如果增量结果达到 1000 条，继续用最后一条消息的 `rowid` 请求下一页。发送接口会调用本机 Messages；没有执行真实消息发送的测试。
 
-- 收：FSEvents 监听 `~/Library/Messages`，写入后毫秒级读 `chat.db`（只读，实测事件触发 <30ms），另有 5 秒兜底轮询；游标存 `cursor.txt`，空文本（已读回执等）已过滤。
-- 发：写 `/tmp/imsg-rs-send.scpt` 后经 `ssh localhost` 执行，超时 15s。
-- 日志：`imsg-rs.log`（收到的消息与错误）。
+## WebSocket
 
-## 已知边界
+连接 `ws://127.0.0.1:8421/` 或 `/ws`。每条消息是与 HTTP 相同结构的 JSON。指定 `?since=<rowid>` 可在建立连接时回放该 rowid 之后的消息；AI 客户端应持久化已处理的最大 `rowid`，断线后用它重连，避免漏掉断线期间的消息。不指定 `since` 时从服务当前扫描游标开始，只接收之后到达的消息。
 
-- 收依赖 FSEvents；极端情况下事件丢失会由 5 秒兜底轮询补上。
-- 发送用的是固定 iMessage 账户 `ACCOUNT_ID`（本机当前唯一 iMessage 账户），如果账户变了需要改 `ACCOUNT_ID`。
-- 所有流量都在 127.0.0.1:8420，没有鉴权；只在本机用。
+单次回放最多发送 1000 条。回放过长或客户端消费过慢导致队列溢出时，服务发送 `{"type":"resync_required","since":<rowid>,...}` 并关闭连接；客户端从该游标通过 HTTP 分页补齐后再重连。
+
+## 边界
+
+- 接收由 FSEvents 触发扫描，并有 5 秒兜底；不是严格实时保证。
+- API 默认仅监听本机回环地址，不提供身份认证。不要把监听地址改为局域网或公网地址。
+- 浏览器来源只接受 localhost；非浏览器 AI 客户端通常不会发送 `Origin`。
+- `chat.db` 以只读方式打开。空文本和无法解码为文本的系统记录不会作为消息推送，但扫描游标仍会越过这些记录。
