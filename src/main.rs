@@ -15,6 +15,9 @@ use tiny_http::{Header, Request, Response, Server, StatusCode};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Error as WsError, Message, WebSocket};
 
+mod agent;
+mod mcp;
+
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8420";
 const DEFAULT_WS_ADDR: &str = "127.0.0.1:8421";
 const DATABASE_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -557,6 +560,10 @@ fn serve_http(mut request: Request, app: Arc<App>) {
         .map_or((path_and_query.as_str(), None), |(path, query)| {
             (path, Some(query))
         });
+    if path == "/mcp" {
+        agent::serve_http(request, app);
+        return;
+    }
     let method = request.method().as_str();
     let (status, payload) = match (method, path) {
         ("GET", "/health") => match latest_rowid(&app.db_path) {
@@ -930,6 +937,21 @@ fn send_ws_message(websocket: &mut WebSocket<TcpStream>, message: &Msg) -> Resul
 
 fn main() {
     let app = Arc::new(App::from_env());
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    match arguments.as_slice() {
+        [] => {}
+        [mode] if mode == "mcp" || mode == "--mcp" => {
+            if let Err(error) = agent::serve_stdio(&app) {
+                eprintln!("MCP stdio failed: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        _ => {
+            eprintln!("Usage: imsg-rs [mcp]");
+            std::process::exit(2);
+        }
+    }
     app.log("imsg-rs starting");
 
     let receiver_app = Arc::clone(&app);
@@ -971,7 +993,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    fn scratch_database() -> (PathBuf, Connection) {
+    pub(crate) fn scratch_database() -> (PathBuf, Connection) {
         static NEXT_DB: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "imsg-rs-test-{}-{}.sqlite",
